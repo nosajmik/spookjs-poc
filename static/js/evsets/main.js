@@ -61,6 +61,11 @@ Function.prototype.toSource = function() {
     return this.toString().slice(this.toString().indexOf('{')+1,-1);
 }
 
+/*
+ Each chunk corresponds to the T[i]s in line 2 of algorithm 2
+ in the paper (reduction via group testing):
+ {T[1], ..., T[a + 1]} <- split(S, a + 1)
+ */
 Object.defineProperty(Array.prototype, 'chunk', {
     value: function(n){
 		let results = [];
@@ -80,26 +85,6 @@ Object.defineProperty(Array.prototype, 'chunk', {
     }
 });
 
-// OptimizationStatus
-function optimizationStatusToString(status) {
-/* from https://github.com/v8/v8/blob/master/src/runtime/runtime.h */
-	let o = [];
-	if (status & (1<<0)) o.push('kIsFunction');
-	if (status & (1<<1)) o.push('kNeverOptimize');
-	if (status & (1<<2)) o.push('kAlwaysOptimize');
-	if (status & (1<<3)) o.push('kMaybeDeopted');
-	if (status & (1<<4)) o.push('kOptimized');
-	if (status & (1<<5)) o.push('kTurboFanned');
-	if (status & (1<<6)) o.push('kInterpreted');
-	if (status & (1<<7)) o.push('kMarkedForOptimization');
-	if (status & (1<<8)) o.push('kMarkedForConcurrentOptimization');
-	if (status & (1<<9)) o.push('kOptimizingConccurently');
-	if (status & (1<<10)) o.push('kIsExecuting');
-	if (status & (1<<11)) o.push('kTopmostFrameIsTurboFanned');
-	if (status & (1<<12)) o.push('kLiteMode');
-	return o.join("|");
-}
-
 // Lists
 
 // Send log to main thread
@@ -108,7 +93,11 @@ const P = 4096;
 const VERBOSE = false;
 const NOLOG = false;
 
-const THRESHOLD = 50;
+/*
+ Threshold modified to that of Safari's eviction test, namely
+ PLRU send under speculation.
+ */
+const THRESHOLD = 0.29;
 const RESULTS = [];
 
 // global vars to refactor
@@ -117,7 +106,12 @@ var first, next, n;
 exported.build_evset = async function start(options) {
 	// Parse settings
 	const B = 8000;
-	const CONFLICT = true;
+	/*
+	 I need to run Pepe Vila in targeted mode (as opposed to 
+	 finding all eviction sets) so CONFLICT = false. I will
+	 not need conflictSet.
+	 */
+	const CONFLICT = false;
 	const ASSOC = 16;
 	const STRIDE = 4096;
 
@@ -133,6 +127,7 @@ exported.build_evset = async function start(options) {
 	const view = new DataView(memory.buffer);
 
 	if (!NOLOG) log('Prepare new evset');
+	// memory, blocksize, start, victim, #ways, stride, offset
 	const evset = new EvSet(view, B, P*2, P, ASSOC, STRIDE, OFFSET);
 	first = true, next = CONFLICT;
 
@@ -298,23 +293,30 @@ function EvSet(view, nblocks, start=8192, victim=4096, assoc=16, stride=4096, of
 	const RAND = true;
 
 	/* private methods */
+
+	/*
+	 From the paper (Sec V): we first allocate a big memory buffer (view) as a pool of
+	 addresses from where we can suitably choose the candidate sets. genIndices
+	 collects addressses from the buffer using a stride.
+	 */
 	this.genIndices = function (view, stride) {
 		let arr = [], j = 0;
 		for (let i=(stride)/4; i < (view.byteLength-this.start)/4; i += stride/4) {
 			arr[j++] = this.start + this.offset + i*4;
+			// offset is page offset of the victim (and all addresses in buffer)
+			// the /4s and *4 cancel each other, but this seems to be for consistency
+			// because Pepe Vila works over Uint32Arrays (view.setUint32)
 		}
-		arr.unshift(this.start + this.offset);
+		arr.unshift(this.start + this.offset); // prepends to beginning of array
 		return arr;
 	}
 
-	this.randomize = function (arr) {
-		for (let i = arr.length; i; i--) {
-			var j = Math.floor(Math.random() * i | 0) | 0;
-			[arr[i - 1], arr[j]] = [arr[j], arr[i - 1]];
-		}
-		return arr;
-	}
-
+	/*
+	 From paper Sec V: for reducing the effect of hardware prefetching we use
+	 a linked list to represent eviction sets, where each element is a pointer
+	 to the next address. This ensures that all memory loads are executed in order.
+	 We further randomize the order of elements.
+	 */
 	this.indicesToLinkedList =  function (buf, indices) {
 		if (indices.length == 0) {
 			this.ptr = 0;
@@ -328,10 +330,19 @@ function EvSet(view, nblocks, start=8192, victim=4096, assoc=16, stride=4096, of
 		view.setUint32(pre, 0, true);
 	}
 
+	this.randomize = function (arr) {
+		for (let i = arr.length; i; i--) {
+			var j = Math.floor(Math.random() * i | 0) | 0;
+			[arr[i - 1], arr[j]] = [arr[j], arr[i - 1]];
+		}
+		return arr;
+	}
+
 	this.init = function() {
 		let indx = this.genIndices(view, stride);
 		if (RAND) indx = this.randomize(indx);
 		indx.splice(nblocks, indx.length); // select nblocks elements
+		// From paper: randomly select N addresses in the buffer
 		this.indicesToLinkedList(view, indx);
 		return indx;
 	}
@@ -339,17 +350,22 @@ function EvSet(view, nblocks, start=8192, victim=4096, assoc=16, stride=4096, of
 
 	/* properties */
 	this.start = start;
-	this.offset = (offset&0x3f)<<6;
+	this.offset = (offset&0x3f)<<6; // bits 6-12. Cache line offset truncated
 	this.victim = victim+this.offset;
 	view.setUint32(this.victim, 0, true); // lazy alloc
 	this.assoc = assoc;
 	this.ptr = 0;
-	this.refs = this.init();
-	this.del = [];
-	this.vics = [];
+	this.refs = this.init(); // refs is S in Algorithm 2 (the candidate set)
+	this.del = []; // this is a stack of elements removed from the candidate set
+	this.vics = []; // only used for finding all eviction sets
 	/* end-of-properties */
 
 	/* public methods */
+
+	/*
+	 From algorithm 2 in the paper: unlinkChunk is used to do S \ T[i], where 
+	 one group out of the (assoc + 1) groups is removed from S (this.refs).
+	 */
 	this.unlinkChunk = function unlinkChunk(chunk) {
 		let s = this.refs.indexOf(chunk[0]), f = this.refs.indexOf(chunk[chunk.length-1]);
 		view.setUint32(this.refs[f], 0, true);
@@ -366,6 +382,9 @@ function EvSet(view, nblocks, start=8192, victim=4096, assoc=16, stride=4096, of
 		this.del.push(chunk); // right
 	}
 
+	/*
+	 Reverses unlinkChunk, making S whole (the union of all T[i]).
+	 */
 	this.relinkChunk = function relinkChunk() {
 		let chunk = this.del.pop(); // right
 		if (chunk === undefined) {
@@ -382,14 +401,26 @@ function EvSet(view, nblocks, start=8192, victim=4096, assoc=16, stride=4096, of
 		}
 	}
 
+	/*
+	 Algorithm 2 from the paper - threshold group testing.
+	 */
 	this.groupReduction = function groupReduction(miss, threshold) {
+		// MAX is the amount of retries the algorithm will make for
+		// one round of shrinking the eviction set size. This is to
+		// account for false negatives leading to found not being
+		// true even after one round of group testing, and false
+		// positives eliminating ground truth elements.
 		const MAX = 20;
 		let i = 0, r = 0;
+		// Minimum eviction set size is the # of ways in the LLC
 		while (this.refs.length > this.assoc) {
 			let m = this.refs.chunk(this.assoc+1);
 			let found = false;
+			// For each T[i] resulting from splitting S into (assoc + 1) groups
 			for (let c in m) {
+				// Exclude T[i] from S
 				this.unlinkChunk(m[c]);
+				// Replace this part with profile() in my current implementation
 				let t = median(miss(this.victim, this.ptr));
 				if (t < threshold) {
 					this.relinkChunk();
@@ -401,9 +432,13 @@ function EvSet(view, nblocks, start=8192, victim=4096, assoc=16, stride=4096, of
 			if (!found) {
 				r += 1;
 				if (r < MAX) {
+					// not found could be due to false positive in previous round
+					// which caused a ground truth element to be eliminated. Retry.
 					this.relinkChunk();
+					// But if there are no previous rounds to revert to, exit with fail.
 					if (this.del.length === 0) break;
 				} else {
+					// Out of retries, exit with fail.
 					while (this.del.length > 0) {
 						this.relinkChunk();
 					}
@@ -413,6 +448,11 @@ function EvSet(view, nblocks, start=8192, victim=4096, assoc=16, stride=4096, of
 			if (VERBOSE) if (!(i++ % 100)) print('\tremaining size: ', this.refs.length);
 		}
 	}
+
+	/* 
+	 Ignore everything below. This is code used for finding all eviction sets, not
+	 for a specific victim address.
+	 */
 
 	this.linkElement = function linkElement(e) {
 		if (e === undefined) return;

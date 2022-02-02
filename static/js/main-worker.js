@@ -280,6 +280,14 @@ function shuffle(array) {
 
 const END_MARKER = 0x7FFFFFFF;
 class EvictionListL3 {
+    /*
+     Important note: at this point, this.memory is a 
+     Uint32Array, and the code indexes directly into it.
+     Meanwhile, the elements of the eviction set are the byte
+     offsets from the start of the array. Because each index
+     is 4 bytes, we need to divide all the byte offsets by 4.
+     */
+
     constructor(memory, elements) {
         this.elements = elements;
         this.head = elements[0] / 4;
